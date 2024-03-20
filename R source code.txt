@@ -1,0 +1,341 @@
+##My working directory
+setwd("D:/STATISTICS/STATsolutions/Infectious_Diseases/Thesis") 
+
+#Required packages
+library(readxl)
+library(sp)
+library(sf)
+library(spData)
+library(spdep)
+library(spatialreg)
+library(maps)
+library(lmtest) 
+library(corrplot)
+library(ggplot2)
+library(gridExtra)
+library(caret)
+library(dplyr)
+library(rpart)
+library(randomForest)
+library(xgboost)
+library(SHAPforxgboost)
+library(MLmetrics)
+
+##spatial analysis
+##Incidence mapping
+##Load the spatial data
+spatial_data<-st_read("gadm40_BGD_2.shp")
+View(spatial_data)
+
+#Load the incidence data
+incidence_data<-read.csv(file.choose(),header=T)
+
+#Merge both spatial and disease data
+merged_data<-merge(spatial_data,incidence_data,by.x="NAME_2",by.y="NAME_2")
+View(merged_data)
+
+##Airborne disease mapping
+p1<-ggplot(data = merged_data) +
+  geom_sf(aes(fill = Meningococcal), color = "white") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "Incidence") +
+  labs(title = "A1: Meningococcal", subtitle = "") +
+  theme_minimal()+xlab("")+ylab("Latitude");p1
+
+
+#Vector-borne disease mapping
+p7<-ggplot(data = merged_data) +
+  geom_sf(aes(fill = Dengue), color = "white") +
+  scale_fill_gradient(low = "lightseagreen", high = "darkorchid", name = "Incidence") +
+  labs(title = "B1: Dengue", subtitle = "") +
+  theme_minimal()+xlab("")+ylab("Latitude");p7
+
+#waterborne disease mapping
+p13<-ggplot(data = merged_data) +
+  geom_sf(aes(fill = Cholera), color = "white") +
+  scale_fill_gradient(low = "lightsalmon", high = "darkolivegreen", name = "Incidence") +
+  labs(title = "C1: Cholera", subtitle = "") +
+  theme_minimal()+xlab("")+ylab("Latitude");p13
+
+#Upload data
+data<-read_excel("Model.data.AHC.xlsx",sheet="spatial") 
+
+#correlation plot
+data1<-data[c(5:17)]#for airborne
+corr1<-cor(data1);corr1
+corrplot(corr1,method = "color", type="upper",tl.col = "black",tl.srt = 45)
+
+data2<-data[c(5:11,18:23)]#for vector-borne
+corr2<-cor(data2);corr2
+corrplot(corr2,method = "color", type="upper",tl.col = "black",tl.srt = 45)
+
+data3<-data[c(5:11,24:28)]#for waterborne
+corr3<-cor(data3);corr3
+corrplot(corr3,method = "color", type="upper",tl.col = "black",tl.srt = 45)
+
+
+
+##Spatial regression 
+#The dataset is named as "data"
+coordinates(data) <- c("Longitude", "Latitude")
+proj4string(data) <- CRS("+proj=longlat +datum=WGS84") 
+
+# Example using Queen contiguity
+w <- dnearneigh(data, d1 = 0, d2=50)  # Adjust the distance threshold (d2) as needed
+w <- nb2listw(w) 
+
+
+#Overall disease modelling
+airborne<-errorsarlm(y18~x1+x4+x5, data = data, listw = w)#d2=50
+coeftest(airborne)
+
+vector<-errorsarlm(y19~x1+x2+x3+x4, data = data, listw = w)#d2=1
+coeftest(vector)
+
+water<-errorsarlm(y20~x1+x2, data = data, listw = w)#d2=50
+coeftest(water) 
+
+##Machine learning
+#Upload data
+data<-read_excel("Model.data.AHC.xlsx",sheet="ML")
+
+##XGBoost model
+#Data split
+data1<-data[1:8]#airborne
+#70% of the sample size
+smp_size<-floor(0.7 * nrow(data1))
+print(smp_size)
+## set the seed to make partition reproducible
+set.seed(123)
+train_ind <-sample(seq_len(nrow(data1)),size = smp_size)
+train<-data1[1:smp_size,]
+test <-data1[smp_size+1:nrow(data1),]
+test<-na.omit(test)
+
+##XGBoost model for airborne
+dtrain<-xgb.DMatrix(data=as.matrix(train),label=train$y18)
+dtest<-xgb.DMatrix(data=as.matrix(test),label=test$y18)
+
+# XGBoost parameters: This hyper-parameters set is tuned one
+params.xgb <- list(booster = "gbtree", 
+                   objective = "reg:squarederror", 
+                   eta =0.1, 
+                   gamma=1, 
+                   min_child_weight = 5,# ,
+                   lambda=1 )
+# xgb corss-validation train
+xgbcv <- xgb.cv(params =  params.xgb, 
+                data = dtrain, 
+                nrounds = 1000, 
+                nfold = 10, 
+                showsd = F,
+                prediction = T,
+                stratified = T, 
+                print_every_n = 1, 
+                early_stopping_rounds = 30, 
+                maximize = F
+)
+#' Final training and metrics evaluation on test sets
+set.seed(1)
+watchlist = list( test = dtest,
+                  train = dtrain) 
+model.xgb <- xgb.train(params = params.xgb, 
+                       data = dtrain, 
+                       nrounds =  42,   
+                       watchlist = watchlist, 
+                       print_every_n = 1, 
+                       early_stopping_rounds =30, 
+                       maximize = F
+)
+
+#prediction in training
+pre<-predict(model.xgb,dtrain)
+RMSE(train$y18,pre)
+MAE(train$y18,pre)
+MAPE(train$y18,pre)
+
+#Model prediction
+pred<-predict(model.xgb,dtest)
+RMSE(test$y18,pred)
+MAE(test$y18,pred)
+MAPE(test$y18,pred)
+
+#Feature importance using mean |SHAP| values for XGBoost model as best
+shap_values <- shap.values(xgb_model = model.xgb, X_train = dtrain)
+shap_values$mean_shap_score
+
+
+# Learning curve
+ggplot(data = xgbcv$evaluation_log, aes(x = iter, y = train_rmse_mean, color = "Train")) +
+  geom_line() +
+  geom_line(data = xgbcv$evaluation_log, aes(x = iter, y = test_rmse_mean, color = "Test")) +
+  labs(title = "Learning Curve", x = "Boosting Rounds", y = "RMSE") +
+  scale_color_manual(values = c("Train" = "blue", "Test" = "red"))+theme_bw()
+
+
+#Data split
+data2<-data[c(1:7,9)]#vector-borne
+#70% of the sample size
+smp_size<-floor(0.7 * nrow(data2))
+print(smp_size)
+## set the seed to make partition reproducible
+set.seed(123)
+train_ind <-sample(seq_len(nrow(data2)),size = smp_size)
+train<-data2[1:smp_size,]
+test <-data2[smp_size+1:nrow(data2),]
+test<-na.omit(test)
+
+##XGBoost model for vector-borne
+dtrain<-xgb.DMatrix(data=as.matrix(train),label=train$y19)
+dtest<-xgb.DMatrix(data=as.matrix(test),label=test$y19)
+
+# XGBoost parameters: This hyper-parameters set is tuned one
+params.xgb <- list(booster = "gbtree", 
+                   objective = "reg:squarederror", 
+                   eta =0.1, 
+                   gamma=1, 
+                   min_child_weight = 5,# ,
+                   lambda=1 )
+# xgb corss-validation train
+xgbcv <- xgb.cv(params =  params.xgb, 
+                data = dtrain, 
+                nrounds = 1000, 
+                nfold = 10, 
+                showsd = F,
+                prediction = T,
+                stratified = T, 
+                print_every_n = 1, 
+                early_stopping_rounds = 30, 
+                maximize = F
+)
+#' Final training and metrics evaluation on test sets
+set.seed(1)
+watchlist = list( test = dtest,
+                  train = dtrain) 
+model.xgb <- xgb.train(params = params.xgb, 
+                       data = dtrain, 
+                       nrounds =  23,   
+                       watchlist = watchlist, 
+                       print_every_n = 1, 
+                       early_stopping_rounds =30, 
+                       maximize = F
+)
+
+#prediction in training
+pre<-predict(model.xgb,dtrain)
+RMSE(train$y19,pre)
+MAE(train$y19,pre)
+MAPE(train$y19,pre)
+
+#Model prediction
+pred<-predict(model.xgb,dtest)
+RMSE(test$y19,pred)
+MAE(test$y19,pred)
+MAPE(test$y19,pred)
+
+#Feature importance using mean |SHAP| values for XGBoost model as best
+shap_values <- shap.values(xgb_model = model.xgb, X_train = dtrain)
+shap_values$mean_shap_score
+
+
+# Learning curve
+ggplot(data = xgbcv$evaluation_log, aes(x = iter, y = train_rmse_mean, color = "Train")) +
+  geom_line() +
+  geom_line(data = xgbcv$evaluation_log, aes(x = iter, y = test_rmse_mean, color = "Test")) +
+  labs(title = "Learning Curve", x = "Boosting Rounds", y = "RMSE") +
+  scale_color_manual(values = c("Train" = "blue", "Test" = "red"))+theme_bw()
+
+
+#Data split
+data3<-data[c(1:7,10)]#waterborne
+#70% of the sample size
+smp_size<-floor(0.7 * nrow(data3))
+print(smp_size)
+## set the seed to make partition reproducible
+set.seed(123)
+train_ind <-sample(seq_len(nrow(data3)),size = smp_size)
+train<-data3[1:smp_size,]
+test <-data3[smp_size+1:nrow(data3),]
+test<-na.omit(test)
+
+##XGBoost model for waterborne
+dtrain<-xgb.DMatrix(data=as.matrix(train),label=train$y20)
+dtest<-xgb.DMatrix(data=as.matrix(test),label=test$y20)
+
+# XGBoost parameters: This hyper-parameters set is tuned one
+params.xgb <- list(booster = "gbtree", 
+                   objective = "reg:squarederror", 
+                   eta =0.1, 
+                   gamma=1, 
+                   min_child_weight = 5,# ,
+                   lambda=1 )
+# xgb corss-validation train
+xgbcv <- xgb.cv(params =  params.xgb, 
+                data = dtrain, 
+                nrounds = 1000, 
+                nfold = 10, 
+                showsd = F,
+                prediction = T,
+                stratified = T, 
+                print_every_n = 1, 
+                early_stopping_rounds = 30, 
+                maximize = F
+)
+#' Final training and metrics evaluation on test sets
+set.seed(1)
+watchlist = list( test = dtest,
+                  train = dtrain) 
+model.xgb <- xgb.train(params = params.xgb, 
+                       data = dtrain, 
+                       nrounds =  47,   
+                       watchlist = watchlist, 
+                       print_every_n = 1, 
+                       early_stopping_rounds =30, 
+                       maximize = F
+)
+
+#prediction in training
+pre<-predict(model.xgb,dtrain)
+RMSE(train$y20,pre)
+MAE(train$y20,pre)
+MAPE(train$y20,pre)
+
+#Model prediction
+pred<-predict(model.xgb,dtest)
+RMSE(test$y20,pred)
+MAE(test$y20,pred)
+MAPE(test$y20,pred)
+
+#Feature importance using mean |SHAP| values for XGBoost model as best
+shap_values <- shap.values(xgb_model = model.xgb, X_train = dtrain)
+shap_values$mean_shap_score
+
+
+# Learning curve
+ggplot(data = xgbcv$evaluation_log, aes(x = iter, y = train_rmse_mean, color = "Train")) +
+  geom_line() +
+  geom_line(data = xgbcv$evaluation_log, aes(x = iter, y = test_rmse_mean, color = "Test")) +
+  labs(title = "Learning Curve", x = "Boosting Rounds", y = "RMSE") +
+  scale_color_manual(values = c("Train" = "blue", "Test" = "red"))+theme_bw()
+
+
+##SHAP plot
+shap1<-read_excel("mean.shap.AHC.xlsx",sheet="air");shap1
+fig1<-ggplot(shap1,aes(x=SHAP,y=reorder(Feature,SHAP),fill=Feature))+
+  geom_bar(stat="identity",position = "dodge")+theme(text = element_text(size=18))+
+  theme_set(theme_bw()+theme(legend.position ="none"))+
+  ggtitle("Mean SHAP for Airborne disease")+xlab("mean |SHAP|")+ylab("Features")
+fig1
+
+shap2<-read_excel("mean.shap.AHC.xlsx",sheet="vector");shap2
+fig2<-ggplot(shap2,aes(x=SHAP,y=reorder(Feature,SHAP),fill=Feature))+
+  geom_bar(stat="identity",position = "dodge")+theme(text = element_text(size=18))+
+  theme_set(theme_bw()+theme(legend.position ="none"))+
+  ggtitle("Mean SHAP for Vector-borne disease")+xlab("mean |SHAP|")+ylab("Features")
+fig2
+
+shap3<-read_excel("mean.shap.AHC.xlsx",sheet="water");shap3
+fig3<-ggplot(shap3,aes(x=SHAP,y=reorder(Feature,SHAP),fill=Feature))+
+  geom_bar(stat="identity",position = "dodge")+theme(text = element_text(size=18))+
+  theme_set(theme_bw()+theme(legend.position ="none"))+
+  ggtitle("Mean SHAP for Waterborne disease")+xlab("mean |SHAP|")+ylab("Features")
+fig3 
